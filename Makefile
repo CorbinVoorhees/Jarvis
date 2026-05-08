@@ -10,6 +10,9 @@ lint:
 format:
 	python -m black .
 
+migrate:
+	python -m alembic upgrade head
+
 check:
 	pytest
 	python -m ruff check .
