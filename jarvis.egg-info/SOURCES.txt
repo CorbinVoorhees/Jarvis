@@ -25,3 +25,4 @@ jarvis.egg-info/SOURCES.txt
 jarvis.egg-info/dependency_links.txt
 jarvis.egg-info/requires.txt
 jarvis.egg-info/top_level.txt
+tests/test_health.py
