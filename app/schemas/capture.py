@@ -1,7 +1,13 @@
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 class ParsedCapture(BaseModel):
@@ -29,6 +35,13 @@ class ParsedCapture(BaseModel):
 
 class CaptureCreateRequest(BaseModel):
     raw: str = Field(..., min_length=1)
+
+    @field_validator("raw", mode="before")
+    @classmethod
+    def strip_raw(cls, v):
+        if isinstance(v, str):
+            return v.strip()
+        return v
 
 
 class CaptureRead(BaseModel):
