@@ -4,6 +4,7 @@ from sqlalchemy import DateTime, Integer, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.enums import CaptureStatus
 
 
 class Capture(Base):
@@ -26,4 +27,16 @@ class Capture(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'inbox'"),
+        default=CaptureStatus.INBOX.value,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )

@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.capture import ParsedCapture
+from app.schemas.capture import CaptureStatusUpdateRequest, ParsedCapture
 
 
 def test_task_requires_non_empty_title():
@@ -39,3 +39,8 @@ def test_valid_note():
 def test_valid_question():
     p = ParsedCapture(type="question", question="Is it raining?", raw="Is it raining?")
     assert p.question == "Is it raining?"
+
+
+def test_capture_status_update_request_rejects_invalid_status():
+    with pytest.raises(ValidationError):
+        CaptureStatusUpdateRequest.model_validate({"status": "not-valid"})
