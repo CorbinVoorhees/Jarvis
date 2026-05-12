@@ -34,7 +34,16 @@ def test_post_capture_saves_and_returns_payload(client, mock_openai_parse):
     assert data["title"] == "Buy milk"
     assert data["raw"] == "Buy milk today"
     assert data["source"] == "api"
+    assert data["status"] == "inbox"
     assert "created_at" in data
+    assert "updated_at" in data
+    assert data["updated_at"] == data["created_at"]
+
+
+def test_new_capture_defaults_to_inbox(client, mock_openai_parse):
+    response = client.post("/capture", json={"raw": "Reminder"})
+    assert response.status_code == 201
+    assert response.json()["status"] == "inbox"
 
 
 def test_get_capture_by_id(client, mock_openai_parse):
@@ -89,6 +98,88 @@ def test_list_captures_type_filter(client, monkeypatch):
     notes = client.get("/captures", params={"type": "note"})
     assert len(tasks.json()) == 1
     assert len(notes.json()) == 1
+
+
+def test_list_captures_status_filter(client, mock_openai_parse):
+    created = client.post("/capture", json={"raw": "one"})
+    cid = created.json()["id"]
+    client.patch(f"/captures/{cid}/status", json={"status": "processed"})
+    client.post("/capture", json={"raw": "two"})
+    inbox_rows = client.get("/captures", params={"status": "inbox"})
+    assert inbox_rows.status_code == 200
+    assert len(inbox_rows.json()) == 1
+    processed_rows = client.get("/captures", params={"status": "processed"})
+    assert len(processed_rows.json()) == 1
+
+
+def test_list_captures_combined_type_and_status_filter(client, monkeypatch):
+    def parser(raw_text: str, client=None):
+        if "NOTE" in raw_text:
+            return ParsedCapture(
+                type="note",
+                title=None,
+                content="body",
+                question=None,
+                time=None,
+                raw=raw_text,
+            )
+        return ParsedCapture(
+            type="task",
+            title="t",
+            content=None,
+            question=None,
+            time=None,
+            raw=raw_text,
+        )
+
+    monkeypatch.setattr(
+        "app.services.capture_service.parse_capture_with_openai",
+        parser,
+    )
+    t1 = client.post("/capture", json={"raw": "task a"}).json()
+    n1 = client.post("/capture", json={"raw": "NOTE x"}).json()
+    client.patch(f"/captures/{t1['id']}/status", json={"status": "processed"})
+    client.patch(f"/captures/{n1['id']}/status", json={"status": "inbox"})
+    combined = client.get("/captures", params={"type": "task", "status": "inbox"})
+    assert combined.status_code == 200
+    assert len(combined.json()) == 0
+    notes_inbox = client.get("/captures", params={"type": "note", "status": "inbox"})
+    assert len(notes_inbox.json()) == 1
+
+
+def test_patch_capture_status_success(client, mock_openai_parse):
+    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    resp = client.patch(f"/captures/{cid}/status", json={"status": "processed"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "processed"
+    assert body["id"] == cid
+
+
+def test_patch_capture_status_invalid_returns_422(client):
+    resp = client.patch("/captures/999999/status", json={"status": "not-a-status"})
+    assert resp.status_code == 422
+
+
+def test_patch_capture_status_database_failure_returns_500(client, mock_openai_parse, monkeypatch):
+    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+
+    def boom(*args, **kwargs):
+        raise OperationalError("UPDATE", {}, Exception("db"))
+
+    monkeypatch.setattr(CaptureRepository, "update_status", boom)
+    resp = client.patch(f"/captures/{cid}/status", json={"status": "processed"})
+    assert resp.status_code == 500
+
+
+def test_patch_capture_status_missing_returns_404(client):
+    resp = client.patch("/captures/999999/status", json={"status": "processed"})
+    assert resp.status_code == 404
+
+
+def test_list_captures_invalid_status_query_returns_422(client):
+    resp = client.get("/captures", params={"status": "bogus"})
+    assert resp.status_code == 422
 
 
 def test_capture_database_failure_returns_500(client, monkeypatch, mock_openai_parse):

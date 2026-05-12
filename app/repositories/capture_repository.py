@@ -39,6 +39,7 @@ class CaptureRepository:
         limit: int,
         offset: int,
         type_filter: str | None = None,
+        status_filter: str | None = None,
     ) -> list[Capture]:
         stmt: Select[tuple[Capture]] = select(Capture).order_by(
             Capture.created_at.desc(),
@@ -46,9 +47,23 @@ class CaptureRepository:
         )
         if type_filter is not None:
             stmt = stmt.where(Capture.type == type_filter)
+        if status_filter is not None:
+            stmt = stmt.where(Capture.status == status_filter)
         stmt = stmt.limit(limit).offset(offset)
         return list(self._db.scalars(stmt).all())
 
     def get_by_id(self, capture_id: int) -> Capture | None:
         stmt = select(Capture).where(Capture.id == capture_id)
         return self._db.scalars(stmt).first()
+
+    def update_status(self, capture_id: int, status: str) -> tuple[Capture, str] | None:
+        row = self.get_by_id(capture_id)
+        if row is None:
+            return None
+        old_status = row.status
+        if old_status == status:
+            return (row, old_status)
+        row.status = status
+        self._db.flush()
+        self._db.refresh(row)
+        return (row, old_status)

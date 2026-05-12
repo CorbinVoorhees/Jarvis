@@ -9,7 +9,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import get_capture_service
 from app.core.exceptions import UpstreamParseError
-from app.schemas.capture import CaptureCreateRequest, CaptureRead
+from app.enums import CaptureStatus
+from app.schemas.capture import CaptureCreateRequest, CaptureRead, CaptureStatusUpdateRequest
 from app.services.capture_service import CaptureService
 
 logger = logging.getLogger(__name__)
@@ -59,9 +60,15 @@ def list_captures(
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     capture_type: CaptureTypeFilter | None = Query(default=None, alias="type"),
+    capture_status: CaptureStatus | None = Query(default=None, alias="status"),
 ):
     try:
-        return service.list_captures(limit=limit, offset=offset, type_filter=capture_type)
+        return service.list_captures(
+            limit=limit,
+            offset=offset,
+            type_filter=capture_type,
+            status_filter=capture_status.value if capture_status is not None else None,
+        )
     except SQLAlchemyError:
         logger.exception("Database error during capture list")
         raise HTTPException(status_code=500, detail="Database error") from None
@@ -80,3 +87,19 @@ def get_capture(
     if row is None:
         raise HTTPException(status_code=404, detail="Not found")
     return row
+
+
+@router.patch("/captures/{capture_id}/status", response_model=CaptureRead)
+def patch_capture_status(
+    capture_id: int,
+    body: CaptureStatusUpdateRequest,
+    service: Annotated[CaptureService, Depends(get_capture_service)],
+):
+    try:
+        updated = service.update_capture_status(capture_id, body.status)
+    except SQLAlchemyError:
+        logger.exception("Database error during capture status update id=%s", capture_id)
+        raise HTTPException(status_code=500, detail="Database error") from None
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return updated

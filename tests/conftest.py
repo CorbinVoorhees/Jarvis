@@ -1,7 +1,11 @@
 import os
+from pathlib import Path
 
 import pytest
+from alembic.config import Config
 from sqlalchemy import text
+
+from alembic import command
 
 os.environ.setdefault(
     "DATABASE_URL",
@@ -16,7 +20,6 @@ def prepare_database():
 
     get_settings.cache_clear()
 
-    from app.db.base import Base
     from app.db.session import configure_db, get_engine, reset_db_engine
 
     reset_db_engine()
@@ -28,7 +31,15 @@ def prepare_database():
     except Exception as exc:
         pytest.skip(f"PostgreSQL not reachable: {exc}")
 
-    Base.metadata.create_all(bind=engine)
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS alembic_version CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS captures CASCADE"))
+
+    command.upgrade(cfg, "head")
     yield
 
 

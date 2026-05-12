@@ -3,6 +3,7 @@ import logging
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.enums import CaptureStatus
 from app.integrations.openai_capture import parse_capture_with_openai
 from app.repositories.capture_repository import CaptureRepository
 from app.schemas.capture import CaptureRead, ParsedCapture
@@ -49,13 +50,20 @@ class CaptureService:
         limit: int,
         offset: int,
         type_filter: str | None = None,
+        status_filter: str | None = None,
     ) -> list[CaptureRead]:
-        rows = self._repo.list_captures(limit=limit, offset=offset, type_filter=type_filter)
+        rows = self._repo.list_captures(
+            limit=limit,
+            offset=offset,
+            type_filter=type_filter,
+            status_filter=status_filter,
+        )
         logger.info(
-            "Listed captures limit=%s offset=%s type_filter=%s count=%s",
+            "Listed captures limit=%s offset=%s type_filter=%s status_filter=%s count=%s",
             limit,
             offset,
             type_filter,
+            status_filter,
             len(rows),
         )
         return [CaptureRead.model_validate(r) for r in rows]
@@ -67,3 +75,29 @@ class CaptureService:
         else:
             logger.info("Capture not found id=%s", capture_id)
         return CaptureRead.model_validate(row) if row else None
+
+    def update_capture_status(
+        self,
+        capture_id: int,
+        new_status: CaptureStatus,
+    ) -> CaptureRead | None:
+        try:
+            outcome = self._repo.update_status(capture_id, new_status.value)
+            if outcome is None:
+                return None
+            row, old_status = outcome
+            if old_status != new_status.value:
+                self._db.commit()
+        except SQLAlchemyError:
+            self._db.rollback()
+            logger.exception("Database error while updating capture status id=%s", capture_id)
+            raise
+
+        if old_status != new_status.value:
+            logger.info(
+                "Capture %s status changed %s → %s",
+                capture_id,
+                old_status,
+                new_status.value,
+            )
+        return CaptureRead.model_validate(row)

@@ -9,6 +9,8 @@ from pydantic import (
     model_validator,
 )
 
+from app.enums import CaptureStatus
+
 
 class ParsedCapture(BaseModel):
     """Validated capture produced by the parser. Source of truth for cross-field rules."""
@@ -55,10 +57,24 @@ class CaptureRead(BaseModel):
     time: str | None
     raw: str
     source: str
+    status: CaptureStatus
     created_at: datetime
+    updated_at: datetime
 
     @field_serializer("created_at")
     def created_at_utc_z(self, v: datetime) -> str:
         if v.tzinfo is None:
             v = v.replace(tzinfo=timezone.utc)
         return v.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @field_serializer("updated_at")
+    def updated_at_utc_z(self, v: datetime) -> str:
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class CaptureStatusUpdateRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    status: CaptureStatus
