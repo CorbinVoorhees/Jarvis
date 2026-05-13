@@ -1,6 +1,8 @@
 import pytest
 from sqlalchemy.exc import OperationalError
 
+import app.repositories.capture_repository as capture_repository_module
+from app.core.exceptions import CaptureUpdateInvariantViolation
 from app.repositories.capture_repository import CaptureRepository
 from app.schemas.capture import ParsedCapture
 
@@ -175,6 +177,165 @@ def test_patch_capture_status_database_failure_returns_500(client, mock_openai_p
 def test_patch_capture_status_missing_returns_404(client):
     resp = client.patch("/captures/999999/status", json={"status": "processed"})
     assert resp.status_code == 404
+
+
+def test_patch_capture_partial_update_keeps_unset_fields(client, mock_openai_parse):
+    create = client.post("/capture", json={"raw": "Buy milk"})
+    cid = create.json()["id"]
+    patched = client.patch(f"/captures/{cid}", json={"status": "processed"})
+    assert patched.status_code == 200
+    body = patched.json()
+    assert body["title"] == "Buy milk"
+    assert body["raw"] == "Buy milk"
+    assert body["type"] == "task"
+    assert body["status"] == "processed"
+
+
+def test_patch_capture_explicit_null_clears_time(client, monkeypatch):
+    def parser(raw_text: str, client=None):
+        return ParsedCapture(
+            type="task",
+            title="Buy milk",
+            content=None,
+            question=None,
+            time="Friday at 2pm",
+            raw=raw_text,
+        )
+
+    monkeypatch.setattr(
+        "app.services.capture_service.parse_capture_with_openai",
+        parser,
+    )
+    cid = client.post("/capture", json={"raw": "Reminder"}).json()["id"]
+    assert client.get(f"/captures/{cid}").json()["time"] == "Friday at 2pm"
+    cleared = client.patch(f"/captures/{cid}", json={"time": None})
+    assert cleared.status_code == 200
+    assert cleared.json()["time"] is None
+
+
+def test_patch_capture_invalid_type_returns_422(client, mock_openai_parse):
+    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    resp = client.patch(f"/captures/{cid}", json={"type": "not-valid"})
+    assert resp.status_code == 422
+
+
+def test_patch_capture_invalid_status_returns_422(client, mock_openai_parse):
+    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    resp = client.patch(f"/captures/{cid}", json={"status": "unknown"})
+    assert resp.status_code == 422
+
+
+def test_patch_capture_contradictory_task_question_returns_422(client, mock_openai_parse):
+    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    resp = client.patch(
+        f"/captures/{cid}",
+        json={"type": "task", "title": "T", "question": "oops?"},
+    )
+    assert resp.status_code == 422
+
+
+def test_patch_capture_missing_returns_404(client):
+    assert client.patch("/captures/999999", json={"title": "Nope"}).status_code == 404
+
+
+def test_patch_capture_note_to_question_requires_explicit_clears(client, monkeypatch):
+    def parser(raw_text: str, client=None):
+        return ParsedCapture(
+            type="note",
+            title=None,
+            content="note body",
+            question=None,
+            time=None,
+            raw=raw_text,
+        )
+
+    monkeypatch.setattr(
+        "app.services.capture_service.parse_capture_with_openai",
+        parser,
+    )
+    cid = client.post("/capture", json={"raw": "NOTE body"}).json()["id"]
+    bad = client.patch(
+        f"/captures/{cid}",
+        json={"type": "question", "question": "Why?"},
+    )
+    assert bad.status_code == 422
+
+    ok = client.patch(
+        f"/captures/{cid}",
+        json={
+            "type": "question",
+            "question": "Why?",
+            "content": None,
+            "title": None,
+        },
+    )
+    assert ok.status_code == 200
+    out = ok.json()
+    assert out["type"] == "question"
+    assert out["question"] == "Why?"
+    assert out["content"] is None
+    assert out["title"] is None
+
+
+def test_patch_capture_forbidden_extra_field_returns_422(client, mock_openai_parse):
+    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    resp = client.patch(f"/captures/{cid}", json={"title": "Renamed", "raw": "changed"})
+    assert resp.status_code == 422
+
+
+def test_patch_capture_no_op_does_not_advance_updated_at(client, mock_openai_parse):
+    """Echo PATCH exercises merge logic without DB writes.
+
+    Timestamp equality below compares CaptureRead API strings (second resolution only),
+    not microsecond equality against stored DB values.
+    """
+    cid = client.post("/capture", json={"raw": "hello"}).json()["id"]
+    before = client.get(f"/captures/{cid}").json()
+    echo = {
+        "type": before["type"],
+        "title": before["title"],
+        "content": before["content"],
+        "question": before["question"],
+        "time": before["time"],
+        "status": before["status"],
+    }
+    after = client.patch(f"/captures/{cid}", json=echo)
+    assert after.status_code == 200
+    body = after.json()
+    assert body["title"] == before["title"]
+    assert body["updated_at"] == before["updated_at"]
+
+
+def test_patch_capture_keeps_id_source_created_at_raw(client, mock_openai_parse):
+    create = client.post("/capture", json={"raw": "original text"})
+    cid = create.json()["id"]
+    before = client.get(f"/captures/{cid}").json()
+    after = client.patch(f"/captures/{cid}", json={"title": "Adjusted title"}).json()
+    assert after["title"] == "Adjusted title"
+    assert after["id"] == before["id"]
+    assert after["source"] == before["source"]
+    assert after["raw"] == before["raw"]
+    assert after["created_at"] == before["created_at"]
+
+
+def test_patch_capture_database_failure_returns_500(client, mock_openai_parse, monkeypatch):
+    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+
+    def apply_field_updates_flush_fail(self, row, updates):
+        """Mirror apply_field_updates pre-flush work, then simulate flush-level DB failure."""
+        if not updates:
+            return
+        bad = set(updates) - capture_repository_module._CAPTURE_PATCHABLE_COLUMNS
+        if bad:
+            raise CaptureUpdateInvariantViolation(bad)
+        for key, value in updates.items():
+            setattr(row, key, value)
+        raise OperationalError("UPDATE", {}, Exception("db"))
+
+    monkeypatch.setattr(CaptureRepository, "apply_field_updates", apply_field_updates_flush_fail)
+    resp = client.patch(f"/captures/{cid}", json={"title": "Different"})
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == "Database error"
 
 
 def test_list_captures_invalid_status_query_returns_422(client):

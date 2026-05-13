@@ -1,6 +1,7 @@
 import pytest
 from sqlalchemy.orm import Session
 
+from app.core.exceptions import CaptureUpdateInvariantViolation
 from app.repositories.capture_repository import CaptureRepository
 
 pytestmark = pytest.mark.usefixtures("prepare_database", "clean_captures_table")
@@ -39,6 +40,49 @@ def test_repository_update_status_persists(db_session: Session):
     db_session.commit()
 
     assert repo2.get_by_id(row.id).status == "processed"
+
+
+def test_repository_apply_field_updates_persists_columns(db_session: Session):
+    repo = CaptureRepository(db_session)
+    row = repo.create(
+        type="task",
+        title="x",
+        content=None,
+        question=None,
+        time="later",
+        raw="r",
+        source="api",
+    )
+    db_session.commit()
+
+    repo.apply_field_updates(
+        row,
+        {"title": "y", "time": None, "status": "processed"},
+    )
+    db_session.commit()
+
+    r2 = CaptureRepository(db_session)
+    fetched = r2.get_by_id(row.id)
+    assert fetched.title == "y"
+    assert fetched.time is None
+    assert fetched.status == "processed"
+
+
+def test_repository_apply_field_updates_rejects_immutable_keys(db_session: Session):
+    repo = CaptureRepository(db_session)
+    row = repo.create(
+        type="task",
+        title="x",
+        content=None,
+        question=None,
+        time=None,
+        raw="r",
+        source="api",
+    )
+    db_session.commit()
+    with pytest.raises(CaptureUpdateInvariantViolation) as excinfo:
+        repo.apply_field_updates(row, {"title": "ok", "raw": "nope"})
+    assert "raw" in excinfo.value.invalid_keys
 
 
 def test_repository_list_captures_filters_by_status(db_session: Session):

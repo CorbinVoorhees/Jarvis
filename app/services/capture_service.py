@@ -6,7 +6,12 @@ from sqlalchemy.orm import Session
 from app.enums import CaptureStatus
 from app.integrations.openai_capture import parse_capture_with_openai
 from app.repositories.capture_repository import CaptureRepository
-from app.schemas.capture import CaptureRead, ParsedCapture
+from app.schemas.capture import (
+    CapturePatchRequest,
+    CaptureRead,
+    ParsedCapture,
+    validate_capture_consistency,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,79 @@ class CaptureService:
         else:
             logger.info("Capture not found id=%s", capture_id)
         return CaptureRead.model_validate(row) if row else None
+
+    @staticmethod
+    def _normalized_patch_text(value: str | None) -> str | None:
+        """Strip user strings; blank becomes None."""
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped if stripped else None
+
+    def patch_capture(self, capture_id: int, patch: CapturePatchRequest) -> CaptureRead | None:
+        row = self._repo.get_by_id(capture_id)
+        if row is None:
+            logger.info("Capture patch: missing capture id=%s", capture_id)
+            return None
+
+        if not patch.model_fields_set:
+            return CaptureRead.model_validate(row)
+
+        fs = patch.model_fields_set
+        merged_type = patch.type if "type" in fs else row.type
+        merged_status = patch.status.value if "status" in fs else row.status
+
+        merged_title = row.title
+        merged_content = row.content
+        merged_question = row.question
+        merged_time = row.time
+        if "title" in fs:
+            merged_title = self._normalized_patch_text(patch.title)
+        if "content" in fs:
+            merged_content = self._normalized_patch_text(patch.content)
+        if "question" in fs:
+            merged_question = self._normalized_patch_text(patch.question)
+        if "time" in fs:
+            merged_time = self._normalized_patch_text(patch.time)
+
+        validate_capture_consistency(
+            capture_type=merged_type,
+            title=merged_title,
+            content=merged_content,
+            question=merged_question,
+        )
+
+        updates: dict[str, object] = {}
+        if merged_type != row.type:
+            updates["type"] = merged_type
+        if merged_title != row.title:
+            updates["title"] = merged_title
+        if merged_content != row.content:
+            updates["content"] = merged_content
+        if merged_question != row.question:
+            updates["question"] = merged_question
+        if merged_time != row.time:
+            updates["time"] = merged_time
+        if merged_status != row.status:
+            updates["status"] = merged_status
+
+        if not updates:
+            return CaptureRead.model_validate(row)
+
+        try:
+            self._repo.apply_field_updates(row, updates)
+            self._db.commit()
+        except SQLAlchemyError:
+            self._db.rollback()
+            logger.exception("Database error while patching capture id=%s", capture_id)
+            raise
+
+        logger.info(
+            "Capture %s updated fields=%s",
+            capture_id,
+            ",".join(sorted(updates.keys())),
+        )
+        return CaptureRead.model_validate(row)
 
     def update_capture_status(
         self,

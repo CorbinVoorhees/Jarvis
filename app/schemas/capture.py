@@ -11,13 +11,15 @@ from pydantic import (
 
 from app.enums import CaptureStatus
 
+CaptureTypeLiteral = Literal["task", "note", "question"]
+
 
 class ParsedCapture(BaseModel):
     """Validated capture produced by the parser. Source of truth for cross-field rules."""
 
     model_config = {"extra": "forbid"}
 
-    type: Literal["task", "note", "question"]
+    type: CaptureTypeLiteral
     title: str | None = None
     content: str | None = None
     question: str | None = None
@@ -47,6 +49,12 @@ class CaptureCreateRequest(BaseModel):
 
 
 class CaptureRead(BaseModel):
+    """API read model.
+
+    Datetime fields serialize to UTC with second resolution only (no fractional seconds).
+    Clients comparing timestamps should treat equality at API-string granularity.
+    """
+
     model_config = {"from_attributes": True}
 
     id: int
@@ -78,3 +86,61 @@ class CaptureStatusUpdateRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
     status: CaptureStatus
+
+
+class CapturePatchRequest(BaseModel):
+    """Partial PATCH body.
+
+    Omitted keys are unchanged; explicit null clears nullable fields.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    type: CaptureTypeLiteral | None = None
+    title: str | None = None
+    content: str | None = None
+    question: str | None = None
+    time: str | None = None
+    status: CaptureStatus | None = None
+
+    @model_validator(mode="after")
+    def reject_null_type_or_status(self):
+        if "type" in self.model_fields_set and self.type is None:
+            raise ValueError("type cannot be null")
+        if "status" in self.model_fields_set and self.status is None:
+            raise ValueError("status cannot be null")
+        return self
+
+
+def validate_capture_consistency(
+    *,
+    capture_type: str,
+    title: str | None,
+    content: str | None,
+    question: str | None,
+) -> None:
+    """Cross-field rules for merged capture state. Raises ValueError on invalid state.
+
+    Tasks may retain non-null content; notes may retain non-null title — both allowed by PRD today.
+    """
+    if capture_type == "task":
+        if not (title and title.strip()):
+            raise ValueError("title is required for task captures")
+        if question is not None:
+            raise ValueError("question must be null for task captures")
+        return None
+    if capture_type == "note":
+        if not (content and content.strip()):
+            raise ValueError("content is required for note captures")
+        if question is not None:
+            raise ValueError("question must be null for note captures")
+        return None
+    if capture_type == "question":
+        if not (question and question.strip()):
+            raise ValueError("question is required for question captures")
+        if title is not None:
+            raise ValueError("title must be null for question captures")
+        if content is not None:
+            raise ValueError("content must be null for question captures")
+        return None
+    raise ValueError(f"invalid capture type: {capture_type}")
