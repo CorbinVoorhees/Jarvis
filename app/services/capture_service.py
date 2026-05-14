@@ -1,12 +1,17 @@
 import logging
+from datetime import datetime
 
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.enums import CaptureStatus
+from app.core.exceptions import ExternalIdConflictError
+from app.enums import CaptureSource, CaptureStatus
+from app.ingestion.dedup import normalized_raw_sha256_hex
 from app.integrations.openai_capture import parse_capture_with_openai
 from app.repositories.capture_repository import CaptureRepository
 from app.schemas.capture import (
+    CaptureCreateRequest,
+    CaptureIngestResponse,
     CapturePatchRequest,
     CaptureRead,
     ParsedCapture,
@@ -15,21 +20,110 @@ from app.schemas.capture import (
 
 logger = logging.getLogger(__name__)
 
+DUPLICATE_INGEST_WINDOW_SECONDS = 60
+
+_UQ_SOURCE_EXTERNAL_ID_INDEX = "uq_captures_source_external_id"
+
+
+def _external_id_unique_violation(exc: IntegrityError) -> bool:
+    """True when PostgreSQL rejects duplicate (source, external_id) for our partial unique index."""
+    orig = getattr(exc, "orig", None)
+    if orig is None:
+        return False
+    pgcode = getattr(orig, "pgcode", None)
+    diag = getattr(orig, "diag", None)
+    if pgcode == "23505":
+        constraint = getattr(diag, "constraint_name", None) if diag is not None else None
+        if constraint == _UQ_SOURCE_EXTERNAL_ID_INDEX:
+            return True
+        # Some drivers omit constraint_name; Postgres error detail still names the violated index.
+        return _UQ_SOURCE_EXTERNAL_ID_INDEX in str(orig)
+    return False
+
+
+def _normalized_ingestion_source(source: str | CaptureSource | None) -> str:
+    if isinstance(source, CaptureSource):
+        return source.value
+    if source is None:
+        return CaptureSource.API.value
+    try:
+        return CaptureSource(source).value
+    except ValueError:
+        allowed = ", ".join(sorted(s.value for s in CaptureSource))
+        raise ValueError(f"invalid capture source {source!r}; must be one of: {allowed}") from None
+
 
 class CaptureService:
     def __init__(self, db: Session):
         self._db = db
         self._repo = CaptureRepository(db)
 
-    def create_from_raw(self, raw_text: str) -> CaptureRead:
-        parsed = parse_capture_with_openai(raw_text)
-        return self._persist_parsed(parsed)
+    def ingest(
+        self,
+        body: CaptureCreateRequest,
+        *,
+        duplicate_check_anchor_utc: datetime | None = None,
+    ) -> CaptureIngestResponse:
+        raw_stripped = body.raw
+        source = CaptureSource.API.value if body.source is None else body.source.value
+        external_id = body.external_id
+        ingest_hash = normalized_raw_sha256_hex(raw_stripped)
 
-    def create_from_parsed(self, parsed: ParsedCapture) -> CaptureRead:
-        """Used when OpenAI is mocked in tests."""
-        return self._persist_parsed(parsed)
+        duplicate = self._repo.find_recent_duplicate_by_hash_and_source(
+            source=source,
+            normalized_raw_hash=ingest_hash,
+            window_seconds=DUPLICATE_INGEST_WINDOW_SECONDS,
+            as_of_utc=duplicate_check_anchor_utc,
+        )
+        if duplicate is not None:
+            # Return the latest DB state for that row (reflects PATCH); do not INSERT or re-parse.
+            # A differing external_id on the replay body is logged only—not stored on this path.
+            cap_read = CaptureRead.model_validate(duplicate)
+            logger.info(
+                "source=%s duplicate=%s capture_id=%s external_id=%s",
+                source,
+                str(True).lower(),
+                duplicate.id,
+                external_id if external_id is not None else "",
+            )
+            return CaptureIngestResponse(duplicate=True, capture=cap_read)
 
-    def _persist_parsed(self, parsed: ParsedCapture) -> CaptureRead:
+        parsed = parse_capture_with_openai(raw_stripped)
+        persisted = self._persist_parsed(
+            parsed,
+            source=source,
+            ingest_hash=ingest_hash,
+            external_id=external_id,
+        )
+        return CaptureIngestResponse(duplicate=False, capture=persisted)
+
+    def create_from_raw(self, raw_text: str) -> CaptureIngestResponse:
+        return self.ingest(CaptureCreateRequest(raw=raw_text))
+
+    def create_from_parsed(
+        self,
+        parsed: ParsedCapture,
+        *,
+        source: str | CaptureSource | None = None,
+        external_id: str | None = None,
+    ) -> CaptureRead:
+        """Used when OpenAI is mocked in tests.
+
+        Raises:
+            ValueError: If ``source`` is a string that is not a valid CaptureSource value.
+        """
+        src = _normalized_ingestion_source(source)
+        return self._persist_parsed(parsed, source=src, external_id=external_id)
+
+    def _persist_parsed(
+        self,
+        parsed: ParsedCapture,
+        *,
+        source: str = CaptureSource.API.value,
+        ingest_hash: str | None = None,
+        external_id: str | None = None,
+    ) -> CaptureRead:
+        h = ingest_hash if ingest_hash is not None else normalized_raw_sha256_hex(parsed.raw)
         try:
             row = self._repo.create(
                 type=parsed.type,
@@ -38,15 +132,33 @@ class CaptureService:
                 question=parsed.question,
                 time=parsed.time,
                 raw=parsed.raw,
-                source="api",
+                source=source,
+                normalized_raw_hash=h,
+                external_id=external_id,
             )
             self._db.commit()
+        except IntegrityError as e:
+            self._db.rollback()
+            if _external_id_unique_violation(e):
+                logger.warning(
+                    "external_id uniqueness violation during capture save source=%s",
+                    source,
+                )
+                raise ExternalIdConflictError from None
+            logger.exception("Database error while saving capture")
+            raise
         except SQLAlchemyError:
             self._db.rollback()
             logger.exception("Database error while saving capture")
             raise
 
-        logger.info("Capture saved id=%s type=%s", row.id, row.type)
+        logger.info(
+            "source=%s duplicate=%s capture_id=%s external_id=%s",
+            source,
+            str(False).lower(),
+            row.id,
+            external_id if external_id is not None else "",
+        )
         return CaptureRead.model_validate(row)
 
     def list_captures(

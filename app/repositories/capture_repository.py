@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
@@ -23,6 +25,8 @@ class CaptureRepository:
         time: str | None,
         raw: str,
         source: str = "api",
+        normalized_raw_hash: str,
+        external_id: str | None = None,
     ) -> Capture:
         row = Capture(
             type=type,
@@ -32,11 +36,40 @@ class CaptureRepository:
             time=time,
             raw=raw,
             source=source,
+            normalized_raw_hash=normalized_raw_hash,
+            external_id=external_id,
         )
         self._db.add(row)
         self._db.flush()
         self._db.refresh(row)
         return row
+
+    def find_recent_duplicate_by_hash_and_source(
+        self,
+        *,
+        source: str,
+        normalized_raw_hash: str,
+        window_seconds: int,
+        as_of_utc: datetime | None = None,
+    ) -> Capture | None:
+        """Most recent duplicate within the window.
+
+        Param ``as_of_utc`` anchors the window exclusively for deterministic tests (UTC).
+
+        The cutoff uses application-server UTC clock; Postgres ``created_at`` uses DB time—a
+        60s window tolerates modest clock skew between hosts.
+        """
+        anchor = as_of_utc if as_of_utc is not None else datetime.now(timezone.utc)
+        cutoff = anchor - timedelta(seconds=window_seconds)
+        stmt: Select[tuple[Capture]] = (
+            select(Capture)
+            .where(Capture.source == source)
+            .where(Capture.normalized_raw_hash == normalized_raw_hash)
+            .where(Capture.created_at >= cutoff)
+            .order_by(Capture.created_at.desc(), Capture.id.desc())
+            .limit(1)
+        )
+        return self._db.scalars(stmt).first()
 
     def list_captures(
         self,

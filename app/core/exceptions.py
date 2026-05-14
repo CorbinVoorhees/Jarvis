@@ -14,3 +14,7 @@ class CaptureUpdateInvariantViolation(JarvisError):
     def __init__(self, invalid_keys: set[str]):
         self.invalid_keys = frozenset(invalid_keys)
         super().__init__("illegal patch column keys")
+
+
+class ExternalIdConflictError(JarvisError):
+    """Duplicate (source, external_id) violates DB uniqueness."""

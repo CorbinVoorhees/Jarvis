@@ -2,16 +2,21 @@ import json
 import logging
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from openai import OpenAIError
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import get_capture_service
-from app.core.exceptions import CaptureUpdateInvariantViolation, UpstreamParseError
-from app.enums import CaptureStatus
+from app.core.exceptions import (
+    CaptureUpdateInvariantViolation,
+    ExternalIdConflictError,
+    UpstreamParseError,
+)
+from app.enums import CaptureSource, CaptureStatus
 from app.schemas.capture import (
     CaptureCreateRequest,
+    CaptureIngestResponse,
     CapturePatchRequest,
     CaptureRead,
     CaptureStatusUpdateRequest,
@@ -27,15 +32,15 @@ CaptureTypeFilter = Literal["task", "note", "question"]
 
 @router.post(
     "/capture",
-    response_model=CaptureRead,
-    status_code=201,
+    response_model=CaptureIngestResponse,
 )
 def create_capture(
+    response: Response,
     body: CaptureCreateRequest,
     service: Annotated[CaptureService, Depends(get_capture_service)],
 ):
     try:
-        return service.create_from_raw(body.raw)
+        result = service.ingest(body)
     except ValidationError as e:
         logger.warning("Capture validation failed: %s", e)
         raise HTTPException(status_code=422, detail=e.errors()) from e
@@ -54,9 +59,21 @@ def create_capture(
     except OpenAIError:
         logger.exception("OpenAI error during capture")
         raise HTTPException(status_code=502, detail="Upstream parse service failed") from None
+    except ExternalIdConflictError:
+        logger.warning(
+            "external_id uniqueness conflict source=%s",
+            body.source.value if body.source is not None else CaptureSource.API.value,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Duplicate external_id for this source",
+        ) from None
     except SQLAlchemyError:
         logger.exception("Database error during capture save")
         raise HTTPException(status_code=500, detail="Database error") from None
+
+    response.status_code = 200 if result.duplicate else 201
+    return result
 
 
 @router.get("/captures", response_model=list[CaptureRead])

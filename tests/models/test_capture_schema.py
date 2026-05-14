@@ -2,11 +2,17 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas.capture import (
+    CaptureCreateRequest,
     CapturePatchRequest,
     CaptureStatusUpdateRequest,
     ParsedCapture,
     validate_capture_consistency,
 )
+
+
+def test_capture_create_request_forbids_extra_fields():
+    with pytest.raises(ValidationError):
+        CaptureCreateRequest.model_validate({"raw": "hi", "normalized_raw_hash": "a" * 64})
 
 
 def test_task_requires_non_empty_title():

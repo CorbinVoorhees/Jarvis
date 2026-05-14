@@ -31,26 +31,29 @@ def test_post_capture_saves_and_returns_payload(client, mock_openai_parse):
     response = client.post("/capture", json={"raw": "Buy milk today"})
     assert response.status_code == 201
     data = response.json()
-    assert data["id"] >= 1
-    assert data["type"] == "task"
-    assert data["title"] == "Buy milk"
-    assert data["raw"] == "Buy milk today"
-    assert data["source"] == "api"
-    assert data["status"] == "inbox"
-    assert "created_at" in data
-    assert "updated_at" in data
-    assert data["updated_at"] == data["created_at"]
+    assert data["duplicate"] is False
+    cap = data["capture"]
+    assert cap["id"] >= 1
+    assert cap["type"] == "task"
+    assert cap["title"] == "Buy milk"
+    assert cap["raw"] == "Buy milk today"
+    assert cap["source"] == "api"
+    assert cap["external_id"] is None
+    assert cap["status"] == "inbox"
+    assert "created_at" in cap
+    assert "updated_at" in cap
+    assert cap["updated_at"] == cap["created_at"]
 
 
 def test_new_capture_defaults_to_inbox(client, mock_openai_parse):
     response = client.post("/capture", json={"raw": "Reminder"})
     assert response.status_code == 201
-    assert response.json()["status"] == "inbox"
+    assert response.json()["capture"]["status"] == "inbox"
 
 
 def test_get_capture_by_id(client, mock_openai_parse):
     create = client.post("/capture", json={"raw": "Pick something"})
-    cid = create.json()["id"]
+    cid = create.json()["capture"]["id"]
     got = client.get(f"/captures/{cid}")
     assert got.status_code == 200
     assert got.json()["id"] == cid
@@ -104,7 +107,7 @@ def test_list_captures_type_filter(client, monkeypatch):
 
 def test_list_captures_status_filter(client, mock_openai_parse):
     created = client.post("/capture", json={"raw": "one"})
-    cid = created.json()["id"]
+    cid = created.json()["capture"]["id"]
     client.patch(f"/captures/{cid}/status", json={"status": "processed"})
     client.post("/capture", json={"raw": "two"})
     inbox_rows = client.get("/captures", params={"status": "inbox"})
@@ -140,8 +143,8 @@ def test_list_captures_combined_type_and_status_filter(client, monkeypatch):
     )
     t1 = client.post("/capture", json={"raw": "task a"}).json()
     n1 = client.post("/capture", json={"raw": "NOTE x"}).json()
-    client.patch(f"/captures/{t1['id']}/status", json={"status": "processed"})
-    client.patch(f"/captures/{n1['id']}/status", json={"status": "inbox"})
+    client.patch(f"/captures/{t1['capture']['id']}/status", json={"status": "processed"})
+    client.patch(f"/captures/{n1['capture']['id']}/status", json={"status": "inbox"})
     combined = client.get("/captures", params={"type": "task", "status": "inbox"})
     assert combined.status_code == 200
     assert len(combined.json()) == 0
@@ -150,7 +153,7 @@ def test_list_captures_combined_type_and_status_filter(client, monkeypatch):
 
 
 def test_patch_capture_status_success(client, mock_openai_parse):
-    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "x"}).json()["capture"]["id"]
     resp = client.patch(f"/captures/{cid}/status", json={"status": "processed"})
     assert resp.status_code == 200
     body = resp.json()
@@ -164,7 +167,7 @@ def test_patch_capture_status_invalid_returns_422(client):
 
 
 def test_patch_capture_status_database_failure_returns_500(client, mock_openai_parse, monkeypatch):
-    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "x"}).json()["capture"]["id"]
 
     def boom(*args, **kwargs):
         raise OperationalError("UPDATE", {}, Exception("db"))
@@ -181,7 +184,7 @@ def test_patch_capture_status_missing_returns_404(client):
 
 def test_patch_capture_partial_update_keeps_unset_fields(client, mock_openai_parse):
     create = client.post("/capture", json={"raw": "Buy milk"})
-    cid = create.json()["id"]
+    cid = create.json()["capture"]["id"]
     patched = client.patch(f"/captures/{cid}", json={"status": "processed"})
     assert patched.status_code == 200
     body = patched.json()
@@ -206,7 +209,7 @@ def test_patch_capture_explicit_null_clears_time(client, monkeypatch):
         "app.services.capture_service.parse_capture_with_openai",
         parser,
     )
-    cid = client.post("/capture", json={"raw": "Reminder"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "Reminder"}).json()["capture"]["id"]
     assert client.get(f"/captures/{cid}").json()["time"] == "Friday at 2pm"
     cleared = client.patch(f"/captures/{cid}", json={"time": None})
     assert cleared.status_code == 200
@@ -214,19 +217,19 @@ def test_patch_capture_explicit_null_clears_time(client, monkeypatch):
 
 
 def test_patch_capture_invalid_type_returns_422(client, mock_openai_parse):
-    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "x"}).json()["capture"]["id"]
     resp = client.patch(f"/captures/{cid}", json={"type": "not-valid"})
     assert resp.status_code == 422
 
 
 def test_patch_capture_invalid_status_returns_422(client, mock_openai_parse):
-    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "x"}).json()["capture"]["id"]
     resp = client.patch(f"/captures/{cid}", json={"status": "unknown"})
     assert resp.status_code == 422
 
 
 def test_patch_capture_contradictory_task_question_returns_422(client, mock_openai_parse):
-    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "x"}).json()["capture"]["id"]
     resp = client.patch(
         f"/captures/{cid}",
         json={"type": "task", "title": "T", "question": "oops?"},
@@ -253,7 +256,7 @@ def test_patch_capture_note_to_question_requires_explicit_clears(client, monkeyp
         "app.services.capture_service.parse_capture_with_openai",
         parser,
     )
-    cid = client.post("/capture", json={"raw": "NOTE body"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "NOTE body"}).json()["capture"]["id"]
     bad = client.patch(
         f"/captures/{cid}",
         json={"type": "question", "question": "Why?"},
@@ -278,7 +281,7 @@ def test_patch_capture_note_to_question_requires_explicit_clears(client, monkeyp
 
 
 def test_patch_capture_forbidden_extra_field_returns_422(client, mock_openai_parse):
-    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "x"}).json()["capture"]["id"]
     resp = client.patch(f"/captures/{cid}", json={"title": "Renamed", "raw": "changed"})
     assert resp.status_code == 422
 
@@ -289,7 +292,7 @@ def test_patch_capture_no_op_does_not_advance_updated_at(client, mock_openai_par
     Timestamp equality below compares CaptureRead API strings (second resolution only),
     not microsecond equality against stored DB values.
     """
-    cid = client.post("/capture", json={"raw": "hello"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "hello"}).json()["capture"]["id"]
     before = client.get(f"/captures/{cid}").json()
     echo = {
         "type": before["type"],
@@ -308,7 +311,7 @@ def test_patch_capture_no_op_does_not_advance_updated_at(client, mock_openai_par
 
 def test_patch_capture_keeps_id_source_created_at_raw(client, mock_openai_parse):
     create = client.post("/capture", json={"raw": "original text"})
-    cid = create.json()["id"]
+    cid = create.json()["capture"]["id"]
     before = client.get(f"/captures/{cid}").json()
     after = client.patch(f"/captures/{cid}", json={"title": "Adjusted title"}).json()
     assert after["title"] == "Adjusted title"
@@ -319,7 +322,7 @@ def test_patch_capture_keeps_id_source_created_at_raw(client, mock_openai_parse)
 
 
 def test_patch_capture_database_failure_returns_500(client, mock_openai_parse, monkeypatch):
-    cid = client.post("/capture", json={"raw": "x"}).json()["id"]
+    cid = client.post("/capture", json={"raw": "x"}).json()["capture"]["id"]
 
     def apply_field_updates_flush_fail(self, row, updates):
         """Mirror apply_field_updates pre-flush work, then simulate flush-level DB failure."""
@@ -341,6 +344,121 @@ def test_patch_capture_database_failure_returns_500(client, mock_openai_parse, m
 def test_list_captures_invalid_status_query_returns_422(client):
     resp = client.get("/captures", params={"status": "bogus"})
     assert resp.status_code == 422
+
+
+def test_duplicate_ingestion_returns_200_normalized_raw(client, mock_openai_parse):
+    first = client.post("/capture", json={"raw": "Hello    WORLD"})
+    assert first.status_code == 201
+    p = first.json()
+    assert p["duplicate"] is False
+    cid = p["capture"]["id"]
+    dup = client.post("/capture", json={"raw": "  hello world  "})
+    assert dup.status_code == 200
+    q = dup.json()
+    assert q["duplicate"] is True
+    assert q["capture"]["id"] == cid
+
+
+def test_duplicate_submit_does_not_add_second_row(client, mock_openai_parse, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.capture_service.DUPLICATE_INGEST_WINDOW_SECONDS",
+        3600,
+    )
+    first = client.post("/capture", json={"raw": "solo message"})
+    assert first.status_code == 201
+    n1 = len(client.get("/captures").json())
+    dup = client.post("/capture", json={"raw": "SOLO MESSAGE"})
+    assert dup.status_code == 200
+    assert dup.json()["duplicate"] is True
+    n2 = len(client.get("/captures").json())
+    assert n1 == n2 == 1
+
+
+def test_duplicate_skips_openai_via_service_monkeypatch(client, monkeypatch):
+    calls: list[str] = []
+
+    def fake(raw_text: str, client_api=None):
+        calls.append(raw_text)
+        return ParsedCapture(
+            type="task",
+            title="stub",
+            content=None,
+            question=None,
+            time=None,
+            raw=raw_text,
+        )
+
+    monkeypatch.setattr(
+        "app.services.capture_service.parse_capture_with_openai",
+        fake,
+    )
+    monkeypatch.setattr(
+        "app.services.capture_service.DUPLICATE_INGEST_WINDOW_SECONDS",
+        3600,
+    )
+    client.post("/capture", json={"raw": "tracked"})
+    client.post("/capture", json={"raw": "Tracked"})
+    assert len(calls) == 1
+
+
+def test_capture_ingestion_invalid_source_returns_422(client, mock_openai_parse):
+    resp = client.post("/capture", json={"raw": "hi", "source": "mars"})
+    assert resp.status_code == 422
+
+
+def test_deduplication_scope_by_source(client, mock_openai_parse):
+    a = client.post("/capture", json={"raw": "same body"})
+    b = client.post("/capture", json={"raw": "same body", "source": "manual"})
+    assert a.status_code == 201 and b.status_code == 201
+    assert a.json()["capture"]["id"] != b.json()["capture"]["id"]
+
+
+def test_capture_ingestion_rejects_unknown_body_fields_returns_422(client, mock_openai_parse):
+    resp = client.post(
+        "/capture",
+        json={"raw": "unique extra field rejection", "normalized_raw_hash": "a" * 64},
+    )
+    assert resp.status_code == 422
+
+
+def test_external_id_conflict_returns_409(client, mock_openai_parse):
+    r1 = client.post("/capture", json={"raw": "first body xyz", "external_id": "ext-a"})
+    assert r1.status_code == 201
+    r2 = client.post("/capture", json={"raw": "other body zzz completely", "external_id": "ext-a"})
+    assert r2.status_code == 409
+
+
+def test_duplicate_replay_same_raw_and_external_id_returns_200_not_409(client, monkeypatch):
+    """Hash+source duplicate check runs before insert; replay does not hit unique index."""
+
+    def fake_parse(raw_text: str, client_api=None):
+        return ParsedCapture(
+            type="task",
+            title="replay",
+            content=None,
+            question=None,
+            time=None,
+            raw=raw_text,
+        )
+
+    monkeypatch.setattr(
+        "app.services.capture_service.parse_capture_with_openai",
+        fake_parse,
+    )
+    monkeypatch.setattr(
+        "app.services.capture_service.DUPLICATE_INGEST_WINDOW_SECONDS",
+        3600,
+    )
+    body_text = "ext replay precedence body"
+    eid = "stable-external-ref"
+    r1 = client.post("/capture", json={"raw": body_text, "external_id": eid})
+    assert r1.status_code == 201
+    p1 = r1.json()
+    r2 = client.post("/capture", json={"raw": body_text, "external_id": eid})
+    assert r2.status_code == 200
+    p2 = r2.json()
+    assert p2["duplicate"] is True
+    assert p2["capture"]["id"] == p1["capture"]["id"]
 
 
 def test_capture_database_failure_returns_500(client, monkeypatch, mock_openai_parse):
