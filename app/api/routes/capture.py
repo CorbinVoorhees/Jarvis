@@ -8,9 +8,14 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import get_capture_service
-from app.core.exceptions import UpstreamParseError
+from app.core.exceptions import CaptureUpdateInvariantViolation, UpstreamParseError
 from app.enums import CaptureStatus
-from app.schemas.capture import CaptureCreateRequest, CaptureRead, CaptureStatusUpdateRequest
+from app.schemas.capture import (
+    CaptureCreateRequest,
+    CapturePatchRequest,
+    CaptureRead,
+    CaptureStatusUpdateRequest,
+)
 from app.services.capture_service import CaptureService
 
 logger = logging.getLogger(__name__)
@@ -99,6 +104,32 @@ def patch_capture_status(
         updated = service.update_capture_status(capture_id, body.status)
     except SQLAlchemyError:
         logger.exception("Database error during capture status update id=%s", capture_id)
+        raise HTTPException(status_code=500, detail="Database error") from None
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return updated
+
+
+@router.patch("/captures/{capture_id}", response_model=CaptureRead)
+def patch_capture(
+    capture_id: int,
+    body: CapturePatchRequest,
+    service: Annotated[CaptureService, Depends(get_capture_service)],
+):
+    try:
+        updated = service.patch_capture(capture_id, body)
+    except CaptureUpdateInvariantViolation as exc:
+        logger.exception(
+            "Capture patch invariant violation id=%s invalid_keys=%s",
+            capture_id,
+            sorted(exc.invalid_keys),
+        )
+        raise HTTPException(status_code=500, detail="Internal server error") from None
+    except ValueError as e:
+        logger.warning("Invalid capture edit id=%s: %s", capture_id, e)
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except SQLAlchemyError:
+        logger.exception("Database error during capture patch id=%s", capture_id)
         raise HTTPException(status_code=500, detail="Database error") from None
     if updated is None:
         raise HTTPException(status_code=404, detail="Not found")

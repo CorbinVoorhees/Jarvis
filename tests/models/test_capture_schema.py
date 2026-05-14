@@ -1,7 +1,12 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.capture import CaptureStatusUpdateRequest, ParsedCapture
+from app.schemas.capture import (
+    CapturePatchRequest,
+    CaptureStatusUpdateRequest,
+    ParsedCapture,
+    validate_capture_consistency,
+)
 
 
 def test_task_requires_non_empty_title():
@@ -44,3 +49,28 @@ def test_valid_question():
 def test_capture_status_update_request_rejects_invalid_status():
     with pytest.raises(ValidationError):
         CaptureStatusUpdateRequest.model_validate({"status": "not-valid"})
+
+
+def test_capture_patch_rejects_null_type_when_explicit():
+    with pytest.raises(ValidationError):
+        CapturePatchRequest.model_validate({"type": None})
+
+
+def test_capture_patch_rejects_null_status_when_explicit():
+    with pytest.raises(ValidationError):
+        CapturePatchRequest.model_validate({"status": None})
+
+
+def test_validate_consistency_task_rejects_question():
+    with pytest.raises(ValueError):
+        validate_capture_consistency(capture_type="task", title="X", content=None, question="Q")
+
+
+def test_validate_consistency_question_rejects_structured_noise():
+    with pytest.raises(ValueError):
+        validate_capture_consistency(
+            capture_type="question",
+            title="T",
+            content=None,
+            question="Q?",
+        )
