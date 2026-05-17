@@ -1,5 +1,5 @@
 import pytest
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 import app.repositories.capture_repository as capture_repository_module
 from app.core.exceptions import CaptureUpdateInvariantViolation
@@ -359,11 +359,7 @@ def test_duplicate_ingestion_returns_200_normalized_raw(client, mock_openai_pars
     assert q["capture"]["id"] == cid
 
 
-def test_duplicate_submit_does_not_add_second_row(client, mock_openai_parse, monkeypatch):
-    monkeypatch.setattr(
-        "app.services.capture_service.DUPLICATE_INGEST_WINDOW_SECONDS",
-        3600,
-    )
+def test_duplicate_submit_does_not_add_second_row(client, mock_openai_parse):
     first = client.post("/capture", json={"raw": "solo message"})
     assert first.status_code == 201
     n1 = len(client.get("/captures").json())
@@ -391,10 +387,6 @@ def test_duplicate_skips_openai_via_service_monkeypatch(client, monkeypatch):
     monkeypatch.setattr(
         "app.services.capture_service.parse_capture_with_openai",
         fake,
-    )
-    monkeypatch.setattr(
-        "app.services.capture_service.DUPLICATE_INGEST_WINDOW_SECONDS",
-        3600,
     )
     client.post("/capture", json={"raw": "tracked"})
     client.post("/capture", json={"raw": "Tracked"})
@@ -429,7 +421,7 @@ def test_external_id_conflict_returns_409(client, mock_openai_parse):
 
 
 def test_duplicate_replay_same_raw_and_external_id_returns_200_not_409(client, monkeypatch):
-    """Hash+source duplicate check runs before insert; replay does not hit unique index."""
+    """Same normalized raw + source replays as duplicate (no external_id unique violation)."""
 
     def fake_parse(raw_text: str, client_api=None):
         return ParsedCapture(
@@ -445,10 +437,6 @@ def test_duplicate_replay_same_raw_and_external_id_returns_200_not_409(client, m
         "app.services.capture_service.parse_capture_with_openai",
         fake_parse,
     )
-    monkeypatch.setattr(
-        "app.services.capture_service.DUPLICATE_INGEST_WINDOW_SECONDS",
-        3600,
-    )
     body_text = "ext replay precedence body"
     eid = "stable-external-ref"
     r1 = client.post("/capture", json={"raw": body_text, "external_id": eid})
@@ -459,6 +447,135 @@ def test_duplicate_replay_same_raw_and_external_id_returns_200_not_409(client, m
     p2 = r2.json()
     assert p2["duplicate"] is True
     assert p2["capture"]["id"] == p1["capture"]["id"]
+
+
+def test_duplicate_replay_different_external_id_keeps_stored(client, monkeypatch):
+    def fake_parse(raw_text: str, client_api=None):
+        return ParsedCapture(
+            type="task",
+            title="replay",
+            content=None,
+            question=None,
+            time=None,
+            raw=raw_text,
+        )
+
+    monkeypatch.setattr(
+        "app.services.capture_service.parse_capture_with_openai",
+        fake_parse,
+    )
+    r1 = client.post("/capture", json={"raw": "external id body", "external_id": "keep-me"})
+    assert r1.status_code == 201
+    r2 = client.post("/capture", json={"raw": "EXTERNAL id body", "external_id": "other"})
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["duplicate"] is True
+    assert body["capture"]["external_id"] == "keep-me"
+
+
+def test_ingest_survives_unique_hash_race_when_lookup_misses_once(client, monkeypatch):
+    """TOCTOU simulation: lookup misses once, INSERT conflicts, handler returns duplicate."""
+    parse_calls: list[str] = []
+
+    def fake_parse(raw_text: str, client_api=None):
+        parse_calls.append(raw_text)
+        return ParsedCapture(
+            type="task",
+            title="race",
+            content=None,
+            question=None,
+            time=None,
+            raw=raw_text,
+        )
+
+    monkeypatch.setattr(
+        "app.services.capture_service.parse_capture_with_openai",
+        fake_parse,
+    )
+
+    r1 = client.post("/capture", json={"raw": "race raw dup"})
+    assert r1.status_code == 201
+    cid = r1.json()["capture"]["id"]
+
+    _orig = CaptureRepository.find_by_source_and_normalized_hash
+
+    def spy_find(self, *, source, normalized_raw_hash):
+        spy_find.calls += 1
+        if spy_find.calls == 1:
+            return None
+        return _orig(self, source=source, normalized_raw_hash=normalized_raw_hash)
+
+    spy_find.calls = 0
+    monkeypatch.setattr(CaptureRepository, "find_by_source_and_normalized_hash", spy_find)
+
+    r2 = client.post("/capture", json={"raw": "RACE raw dup"})
+    assert r2.status_code == 200
+    out = r2.json()
+    assert out["duplicate"] is True
+    assert out["capture"]["id"] == cid
+    assert spy_find.calls == 2
+    assert len(parse_calls) == 2
+    assert len(client.get("/captures").json()) == 1
+
+
+def test_ingest_external_id_constraint_same_raw_returns_duplicate_under_race(client, monkeypatch):
+    """Same raw + same external_id replay must be 200 even if Postgres reports external_id index."""
+
+    def fake_parse(raw_text: str, client_api=None):
+        return ParsedCapture(
+            type="task",
+            title="ext race",
+            content=None,
+            question=None,
+            time=None,
+            raw=raw_text,
+        )
+
+    monkeypatch.setattr(
+        "app.services.capture_service.parse_capture_with_openai",
+        fake_parse,
+    )
+
+    body = "api external id integrity raw"
+    eid = "webhook-msg-99"
+    r1 = client.post("/capture", json={"raw": body, "external_id": eid})
+    assert r1.status_code == 201
+    cid = r1.json()["capture"]["id"]
+
+    _orig_find = CaptureRepository.find_by_source_and_normalized_hash
+
+    def spy_find(self, *, source, normalized_raw_hash):
+        spy_find.calls += 1
+        if spy_find.calls == 1:
+            return None
+        return _orig_find(self, source=source, normalized_raw_hash=normalized_raw_hash)
+
+    spy_find.calls = 0
+    monkeypatch.setattr(CaptureRepository, "find_by_source_and_normalized_hash", spy_find)
+
+    class _Diag:
+        constraint_name = "uq_captures_source_external_id"
+
+    class _Orig:
+        pgcode = "23505"
+        diag = _Diag()
+
+    def create_stub(self, **kwargs):
+        create_stub.calls += 1
+        raise IntegrityError("statement", {}, _Orig())
+
+    create_stub.calls = 0
+    monkeypatch.setattr(CaptureRepository, "create", create_stub)
+
+    r2 = client.post("/capture", json={"raw": body, "external_id": eid})
+    assert r2.status_code == 200
+    body_json = r2.json()
+    assert body_json["duplicate"] is True
+    assert body_json["capture"]["id"] == cid
+    assert body_json["capture"]["external_id"] == eid
+    assert create_stub.calls == 1
+    assert spy_find.calls == 1
+    assert len(client.get("/captures").json()) == 1
 
 
 def test_capture_database_failure_returns_500(client, monkeypatch, mock_openai_parse):

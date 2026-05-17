@@ -121,7 +121,7 @@ def test_repository_list_captures_filters_by_status(db_session: Session):
     assert rows[0].id == second.id
 
 
-def test_find_recent_duplicate_matches_within_window(db_session: Session):
+def test_find_by_source_and_normalized_hash_returns_row(db_session: Session):
     repo = CaptureRepository(db_session)
     h = normalized_raw_sha256_hex("hello world")
     row = repo.create(
@@ -136,16 +136,15 @@ def test_find_recent_duplicate_matches_within_window(db_session: Session):
     db_session.commit()
 
     r2 = CaptureRepository(db_session)
-    dup = r2.find_recent_duplicate_by_hash_and_source(
+    dup = r2.find_by_source_and_normalized_hash(
         source="api",
         normalized_raw_hash=h,
-        window_seconds=3600,
     )
     assert dup is not None
     assert dup.id == row.id
 
 
-def test_find_recent_duplicate_misses_when_older_than_window(db_session: Session):
+def test_find_by_source_and_normalized_hash_finds_row_regardless_of_age(db_session: Session):
     repo = CaptureRepository(db_session)
     h = normalized_raw_sha256_hex("past")
     repo.create(
@@ -162,12 +161,33 @@ def test_find_recent_duplicate_misses_when_older_than_window(db_session: Session
     db_session.commit()
 
     r2 = CaptureRepository(db_session)
-    dup = r2.find_recent_duplicate_by_hash_and_source(
+    dup = r2.find_by_source_and_normalized_hash(
         source="api",
         normalized_raw_hash=h,
-        window_seconds=60,
     )
-    assert dup is None
+    assert dup is not None
+
+
+def test_find_by_source_and_external_id_returns_row(db_session: Session):
+    repo = CaptureRepository(db_session)
+    h = normalized_raw_sha256_hex("with external")
+    row = repo.create(
+        type="task",
+        title="t",
+        content=None,
+        question=None,
+        time=None,
+        raw="with external",
+        source="api",
+        normalized_raw_hash=h,
+        external_id="lookup-me",
+    )
+    db_session.commit()
+
+    r2 = CaptureRepository(db_session)
+    got = r2.find_by_source_and_external_id(source="api", external_id="lookup-me")
+    assert got is not None
+    assert got.id == row.id
 
 
 def test_source_external_id_unique_constraint(db_session: Session):
@@ -204,6 +224,37 @@ def test_source_external_id_unique_constraint(db_session: Session):
             external_id="ext-unique",
         )
     assert "uq_captures_source_external_id" in str(excinfo.value.orig)
+
+
+def test_source_normalized_hash_unique_constraint(db_session: Session):
+    from sqlalchemy.exc import IntegrityError
+
+    repo = CaptureRepository(db_session)
+    h = normalized_raw_sha256_hex("same normalized body")
+    repo.create(
+        type="task",
+        title="one",
+        content=None,
+        question=None,
+        time=None,
+        raw="same normalized body",
+        source="api",
+        normalized_raw_hash=h,
+    )
+    db_session.commit()
+    repo2 = CaptureRepository(db_session)
+    with pytest.raises(IntegrityError) as excinfo:
+        repo2.create(
+            type="task",
+            title="two",
+            content=None,
+            question=None,
+            time=None,
+            raw="SAME    normalized body",
+            source="api",
+            normalized_raw_hash=h,
+        )
+    assert "uq_captures_source_normalized_raw_hash" in str(excinfo.value.orig)
 
 
 def test_duplicate_external_allowed_across_sources(db_session: Session):

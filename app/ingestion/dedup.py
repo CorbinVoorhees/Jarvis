@@ -1,4 +1,9 @@
-"""Normalized raw hashing for duplicate detection (ingestion-wide, source-agnostic)."""
+"""Normalized raw hashing for duplicate detection.
+
+The digest is derived from normalized text only (case and whitespace folding). Application
+dedup keys rows by ``(source, normalized_raw_hash)`` so the same text under different sources
+is kept distinct.
+"""
 
 import hashlib
 import re

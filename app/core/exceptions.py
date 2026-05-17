@@ -18,3 +18,13 @@ class CaptureUpdateInvariantViolation(JarvisError):
 
 class ExternalIdConflictError(JarvisError):
     """Duplicate (source, external_id) violates DB uniqueness."""
+
+
+class DuplicateRawHashConflictError(JarvisError):
+    """Insert lost a race to another row with the same (source, normalized_raw_hash)."""
+
+    __slots__ = ("existing",)
+
+    def __init__(self, existing: object):
+        self.existing = existing
+        super().__init__("duplicate normalized raw hash for source")

@@ -3,7 +3,7 @@ import time
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import app.services.capture_service as capture_service_module
@@ -255,7 +255,6 @@ def fake_parse_always_task(raw_text: str, client=None):
 
 def test_ingest_duplicate_skips_openai(monkeypatch, db_session: Session):
     calls: list[str] = []
-    monkeypatch.setattr(capture_service_module, "DUPLICATE_INGEST_WINDOW_SECONDS", 3600)
 
     def tracking_parse(raw_text: str, client=None):
         calls.append(raw_text)
@@ -273,7 +272,10 @@ def test_ingest_duplicate_skips_openai(monkeypatch, db_session: Session):
     assert len(calls) == 1
 
 
-def test_ingest_outside_duplicate_window_inserts_twice(monkeypatch, db_session: Session):
+def test_ingest_same_normalized_raw_is_duplicate_even_when_created_at_is_old(
+    monkeypatch,
+    db_session: Session,
+):
     monkeypatch.setattr(capture_service_module, "parse_capture_with_openai", fake_parse_always_task)
 
     svc = CaptureService(db_session)
@@ -286,8 +288,89 @@ def test_ingest_outside_duplicate_window_inserts_twice(monkeypatch, db_session: 
 
     svc2 = CaptureService(db_session)
     second = svc2.ingest(req)
-    assert second.duplicate is False
-    assert second.capture.id != first.capture.id
+    assert second.duplicate is True
+    assert second.capture.id == first.capture.id
+
+
+def test_ingest_unique_hash_integrity_path_returns_duplicate(monkeypatch, db_session: Session):
+    parse_calls: list[str] = []
+
+    def tracking_parse(raw_text: str, client=None):
+        parse_calls.append(raw_text)
+        return fake_parse_always_task(raw_text, client)
+
+    monkeypatch.setattr(capture_service_module, "parse_capture_with_openai", tracking_parse)
+    svc = CaptureService(db_session)
+    req = CaptureCreateRequest(raw="integrity path body")
+    first = svc.ingest(req)
+    assert first.duplicate is False
+
+    _orig = CaptureRepository.find_by_source_and_normalized_hash
+
+    def spy_find(self, *, source, normalized_raw_hash):
+        spy_find.calls += 1
+        if spy_find.calls == 1:
+            return None
+        return _orig(self, source=source, normalized_raw_hash=normalized_raw_hash)
+
+    spy_find.calls = 0
+    monkeypatch.setattr(CaptureRepository, "find_by_source_and_normalized_hash", spy_find)
+
+    second = svc.ingest(req)
+    assert second.duplicate is True
+    assert second.capture.id == first.capture.id
+    assert spy_find.calls == 2
+    assert len(parse_calls) == 2
+
+
+def test_external_id_integrity_same_raw_is_duplicate(monkeypatch, db_session: Session):
+    """Postgres may report uq_captures_source_external_id for a same-raw replay race."""
+    monkeypatch.setattr(capture_service_module, "parse_capture_with_openai", fake_parse_always_task)
+    svc = CaptureService(db_session)
+    body = "external id integrity same raw"
+    eid = "ext-race-key"
+    first = svc.ingest(CaptureCreateRequest(raw=body, external_id=eid))
+    assert first.duplicate is False
+
+    _orig_find = CaptureRepository.find_by_source_and_normalized_hash
+
+    def spy_find(self, *, source, normalized_raw_hash):
+        spy_find.calls += 1
+        if spy_find.calls == 1:
+            return None
+        return _orig_find(self, source=source, normalized_raw_hash=normalized_raw_hash)
+
+    spy_find.calls = 0
+    monkeypatch.setattr(CaptureRepository, "find_by_source_and_normalized_hash", spy_find)
+
+    class _Diag:
+        constraint_name = "uq_captures_source_external_id"
+
+    class _Orig:
+        pgcode = "23505"
+        diag = _Diag()
+
+    def create_stub(self, **kwargs):
+        create_stub.calls += 1
+        raise IntegrityError("statement", {}, _Orig())
+
+    create_stub.calls = 0
+    monkeypatch.setattr(CaptureRepository, "create", create_stub)
+
+    second = svc.ingest(CaptureCreateRequest(raw=body, external_id=eid))
+    assert second.duplicate is True
+    assert second.capture.id == first.capture.id
+    assert create_stub.calls == 1
+    assert spy_find.calls == 1
+
+
+def test_duplicate_ingest_logs_when_external_id_differs(monkeypatch, db_session: Session, caplog):
+    monkeypatch.setattr(capture_service_module, "parse_capture_with_openai", fake_parse_always_task)
+    caplog.set_level(logging.WARNING)
+    svc = CaptureService(db_session)
+    svc.ingest(CaptureCreateRequest(raw="shared raw text", external_id="stored-id"))
+    svc.ingest(CaptureCreateRequest(raw="shared raw text", external_id="new-id"))
+    assert any("Ignoring incoming external_id" in rec.message for rec in caplog.records)
 
 
 def test_external_id_conflict_raises_external_id_conflict_error(monkeypatch, db_session: Session):
@@ -297,6 +380,21 @@ def test_external_id_conflict_raises_external_id_conflict_error(monkeypatch, db_
     svc.ingest(CaptureCreateRequest(raw="body one wording", external_id="shared-twilio"))
     with pytest.raises(ExternalIdConflictError):
         svc.ingest(CaptureCreateRequest(raw="very different wording", external_id="shared-twilio"))
+
+
+def test_create_from_parsed_idempotent_on_duplicate_hash(db_session: Session):
+    svc = CaptureService(db_session)
+    parsed = ParsedCapture(
+        type="task",
+        title="t",
+        content=None,
+        question=None,
+        time=None,
+        raw="idempotent create_from_parsed raw",
+    )
+    a = svc.create_from_parsed(parsed)
+    b = svc.create_from_parsed(parsed)
+    assert a.id == b.id
 
 
 def test_create_from_parsed_invalid_string_source_raises(db_session: Session):
@@ -314,7 +412,6 @@ def test_create_from_parsed_invalid_string_source_raises(db_session: Session):
 
 
 def test_duplicate_not_detected_across_sources(monkeypatch, db_session: Session):
-    monkeypatch.setattr(capture_service_module, "DUPLICATE_INGEST_WINDOW_SECONDS", 3600)
     monkeypatch.setattr(capture_service_module, "parse_capture_with_openai", fake_parse_always_task)
 
     svc = CaptureService(db_session)
