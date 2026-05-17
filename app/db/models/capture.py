@@ -23,6 +23,8 @@ class Capture(Base):
         server_default=text("'api'"),
         default="api",
     )
+    normalized_raw_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

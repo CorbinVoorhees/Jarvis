@@ -9,7 +9,7 @@ from pydantic import (
     model_validator,
 )
 
-from app.enums import CaptureStatus
+from app.enums import CaptureSource, CaptureStatus
 
 CaptureTypeLiteral = Literal["task", "note", "question"]
 
@@ -38,7 +38,16 @@ class ParsedCapture(BaseModel):
 
 
 class CaptureCreateRequest(BaseModel):
+    """Ingest POST body."""
+
+    model_config = {"extra": "forbid"}
+
     raw: str = Field(..., min_length=1)
+    source: CaptureSource | None = Field(
+        default=None,
+        description="Ingestion source; defaults to api when omitted.",
+    )
+    external_id: str | None = Field(default=None, max_length=512)
 
     @field_validator("raw", mode="before")
     @classmethod
@@ -47,12 +56,25 @@ class CaptureCreateRequest(BaseModel):
             return v.strip()
         return v
 
+    @field_validator("external_id", mode="before")
+    @classmethod
+    def strip_external_id(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        return v
+
 
 class CaptureRead(BaseModel):
     """API read model.
 
     Datetime fields serialize to UTC with second resolution only (no fractional seconds).
     Clients comparing timestamps should treat equality at API-string granularity.
+
+    ``normalized_raw_hash`` is persisted for ingestion dedup only and is deliberately
+    omitted from this schema—never returned to callers.
     """
 
     model_config = {"from_attributes": True}
@@ -65,6 +87,7 @@ class CaptureRead(BaseModel):
     time: str | None
     raw: str
     source: str
+    external_id: str | None = None
     status: CaptureStatus
     created_at: datetime
     updated_at: datetime
@@ -80,6 +103,13 @@ class CaptureRead(BaseModel):
         if v.tzinfo is None:
             v = v.replace(tzinfo=timezone.utc)
         return v.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class CaptureIngestResponse(BaseModel):
+    """POST /capture response; status is 201 when created, 200 when duplicate replay."""
+
+    duplicate: bool
+    capture: CaptureRead
 
 
 class CaptureStatusUpdateRequest(BaseModel):

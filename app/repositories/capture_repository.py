@@ -23,6 +23,8 @@ class CaptureRepository:
         time: str | None,
         raw: str,
         source: str = "api",
+        normalized_raw_hash: str,
+        external_id: str | None = None,
     ) -> Capture:
         row = Capture(
             type=type,
@@ -32,11 +34,43 @@ class CaptureRepository:
             time=time,
             raw=raw,
             source=source,
+            normalized_raw_hash=normalized_raw_hash,
+            external_id=external_id,
         )
         self._db.add(row)
         self._db.flush()
         self._db.refresh(row)
         return row
+
+    def find_by_source_and_normalized_hash(
+        self,
+        *,
+        source: str,
+        normalized_raw_hash: str,
+    ) -> Capture | None:
+        """Return the capture for this source + normalized hash (unique at DB level)."""
+        stmt: Select[tuple[Capture]] = (
+            select(Capture)
+            .where(Capture.source == source)
+            .where(Capture.normalized_raw_hash == normalized_raw_hash)
+            .limit(1)
+        )
+        return self._db.scalars(stmt).first()
+
+    def find_by_source_and_external_id(
+        self,
+        *,
+        source: str,
+        external_id: str,
+    ) -> Capture | None:
+        """Return the row for (source, external_id); partial unique index allows only one."""
+        stmt: Select[tuple[Capture]] = (
+            select(Capture)
+            .where(Capture.source == source)
+            .where(Capture.external_id == external_id)
+            .limit(1)
+        )
+        return self._db.scalars(stmt).first()
 
     def list_captures(
         self,
