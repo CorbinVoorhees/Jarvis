@@ -1,3 +1,4 @@
+import logging.config as _logging_config
 import os
 from pathlib import Path
 
@@ -6,6 +7,21 @@ from alembic.config import Config
 from sqlalchemy import text
 
 from alembic import command
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _prevent_alembic_disabling_loggers():
+    """Patch fileConfig so alembic never disables existing loggers during tests."""
+    _orig = _logging_config.fileConfig
+
+    def _patched(fname, *args, **kwargs):
+        kwargs.setdefault("disable_existing_loggers", False)
+        return _orig(fname, *args, **kwargs)
+
+    _logging_config.fileConfig = _patched
+    yield
+    _logging_config.fileConfig = _orig
+
 
 os.environ.setdefault(
     "DATABASE_URL",
